@@ -595,7 +595,7 @@ export default function activate(folium) {
     offsets.map[bvid] = clamp(Math.round(Number(ms) / 100) * 100, -5000, 5000);
     renderOffset();
     persistOffsets();
-    alignToSong();
+    forceAlign('offset');
   }
 
   function nudgeOffset(deltaMs) {
@@ -1732,24 +1732,81 @@ export default function activate(folium) {
    * 之前是「视频从头播」，而歌曲早就在第 1 分 30 秒了 —— 搜 MV 的 1.5 秒 + 载入流的 2 秒，
    * 时间全算成延后，所以越看越不对劲。现在每换一次源、每次 loadeddata 都对齐一次。
    */
-  function alignToSong() {
+  /* 对齐的防抖：seek 会重新触发 canplay，没防住就会自己喂自己 */
+  let aligning = false;
+  let alignUnlockTimer = 0;
+  let lastAlignAt = 0;
+  let alignBurst = 0;
+  let alignBurstAt = 0;
+
+  function unlockAlign() {
+    aligning = false;
+    if (alignUnlockTimer) {
+      clearTimeout(alignUnlockTimer);
+      timers.delete(alignUnlockTimer);
+      alignUnlockTimer = 0;
+    }
+  }
+
+  function alignToSong(reason) {
+    // 正在 seek 中就别再进来
+    if (aligning) return;
+
+    // 窗口在后台时完全不对齐。后台媒体会被系统节流，seek 不生效，
+    // 而 seek 又会重新触发 canplay —— 那样会无限自己喂自己，把渲染进程拖死。
+    if (typeof document !== 'undefined' && document.hidden) return;
+
+    const now = Date.now();
+    if (now - lastAlignAt < 1200) return;
+    lastAlignAt = now;
+
+    // 病态保护：5 秒内已经 seek 过 3 次，说明对齐一直在失败，先停手
+    if (now - alignBurstAt > 5000) {
+      alignBurstAt = now;
+      alignBurst = 0;
+    }
+
     const playback = getPlaybackState();
     if (!playback) return;
 
-    const offsetSec = currentOffsetMs() / 1000;
-
-    if (Number.isFinite(playback.position) && Number.isFinite(video.duration) && video.duration > 0) {
+    if (
+      Number.isFinite(playback.position) &&
+      Number.isFinite(video.duration) &&
+      video.duration > 0
+    ) {
+      const offsetSec = currentOffsetMs() / 1000;
       const target = clamp(playback.position - offsetSec, 0, Math.max(0, video.duration - 0.5));
+
       if (Math.abs(video.currentTime - target) > 1.5) {
-        try {
-          video.currentTime = target;
-        } catch {
-          /* 还没到可 seek 的状态，忽略 */
+        if (alignBurst >= 3) {
+          log.warn('对齐反复失败，先停一会儿', { reason, target, at: video.currentTime });
+        } else {
+          alignBurst += 1;
+          aligning = true;
+          try {
+            video.currentTime = target;
+          } catch {
+            unlockAlign();
+          }
+          if (aligning) {
+            // seeked 迟迟不来（后台被挂起）也要能解锁
+            alignUnlockTimer = setTimeout(unlockAlign, 2500);
+            timers.add(alignUnlockTimer);
+          }
         }
       }
     }
 
     syncPlaybackState(playback.state);
+  }
+
+  /** 用户主动触发的对齐（调偏移、拖进度条）：清掉冷却和病态计数，立刻执行。 */
+  function forceAlign(reason) {
+    lastAlignAt = 0;
+    alignBurst = 0;
+    alignBurstAt = 0;
+    unlockAlign();
+    alignToSong(reason);
   }
 
   /** 跟随歌曲的播放 / 暂停 / 停止。 */
@@ -1861,10 +1918,24 @@ export default function activate(folium) {
 
   video.addEventListener('loadeddata', () => {
     showStatus('', 0);
-    alignToSong();
+    forceAlign('loadeddata');
   });
-  video.addEventListener('canplay', () => alignToSong());
+  video.addEventListener('canplay', () => alignToSong('canplay'));
+  video.addEventListener('seeked', unlockAlign);
   video.addEventListener('playing', () => showStatus('', 0));
+
+  // 回到前台时补一次对齐 —— 后台期间我们没跟，回来要追上来。
+  if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        unlockAlign();
+        return;
+      }
+      lastAlignAt = 0;
+      alignBurst = 0;
+      forceAlign('visible');
+    });
+  }
 
   /* ---------------------------------------------------------------- *
    * 换歌 → 搜 MV
@@ -2377,7 +2448,7 @@ export default function activate(folium) {
 
   // 用户拖动歌曲进度条后，视频重新对齐，不要越差越远。
   folium.events.on('playback.seeked', () => {
-    alignToSong();
+    forceAlign('seeked');
   });
 
   folium.registries.stageLayers.register({
@@ -2610,7 +2681,7 @@ export default function activate(folium) {
       if (bvid) delete offsets.map[bvid];
       persistOffsets();
       renderOffset();
-      alignToSong();
+      forceAlign('settings');
     }
     lastSettingsOffset = settingsOffset;
 
