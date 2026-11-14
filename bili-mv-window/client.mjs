@@ -2376,7 +2376,48 @@ export default function activate(folium) {
           .catch(() => {});
       });
 
-      cacheRow.append(cacheInfo, btnClearCache);
+      const btnRemoveThis = document.createElement('button');
+      btnRemoveThis.type = 'button';
+      btnRemoveThis.textContent = '删除这首';
+      btnRemoveThis.title = '只删掉当前这个视频的缓存文件';
+      btnRemoveThis.style.cssText = [
+        'cursor:pointer',
+        'padding:5px 12px',
+        'font-size:11.5px',
+        'border-radius:8px',
+        'border:1px solid rgba(255,255,255,.12)',
+        'background:rgba(255,255,255,.05)',
+        'color:inherit',
+        'flex:none',
+      ].join(';');
+      btnRemoveThis.addEventListener('click', () => {
+        const song = state.song || peekCurrentSong();
+        void folium.rpc
+          .call('removeCache', {
+            bvid: currentBvid(),
+            title: (state.want && state.want.title) || (song && song.title) || '',
+            artist: (state.want && state.want.artist) || '',
+            cacheDir: cacheSpec(),
+          })
+          .then((result) => {
+            if (result && result.ok) {
+              updateCacheInfo(result);
+              folium.ui.toast(`已删除：${result.slug}`, { durationMs: 2200 });
+            } else {
+              folium.ui.toast(
+                (result && result.error) === 'not-cached' ? '这个视频没有缓存' : '删除失败',
+                { type: 'error', durationMs: 2000 },
+              );
+            }
+          })
+          .catch(() => {});
+      });
+
+      const cacheButtons = document.createElement('div');
+      cacheButtons.style.cssText = 'display:flex;gap:6px;flex:none';
+      cacheButtons.append(btnRemoveThis, btnClearCache);
+
+      cacheRow.append(cacheInfo, cacheButtons);
       container.appendChild(cacheRow);
 
       function formatBytes(bytes) {

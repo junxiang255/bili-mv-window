@@ -1090,14 +1090,17 @@ async function resolveMv(input) {
   if (!want.title && !bvidAsked) return { ok: false, error: 'no-song-title' };
 
   // 本地优先：
-  //   1) 指定了某个 BV，而本地正好有它 → 直接用（这是明确意图，永远生效）；
-  //   2) 开了「存到本地」且允许优先本地，且本地有「歌名 - 歌手」同名文件 → 优先放它，不联网。
+  //   指定了某个 BV 时 **只认这一个** 的缓存 —— 不能因为本地有「歌名 - 歌手」的旧文件
+  //   就把用户刚选的另一个视频顶掉（那会导致「选过一次之后就再也换不了」）。
+  //   没指定 BV 时，才按歌名去猜。
   const caching = Boolean(input && input.cache && input.cache !== 'off');
   const preferLocal = !input || input.preferLocal !== false;
 
-  const localHit =
-    (bvidAsked ? findCachedByBvid(bvidAsked) : null) ||
-    (caching && preferLocal && want.title ? findCachedBySong(want.title, want.artist) : null);
+  const localHit = bvidAsked
+    ? findCachedByBvid(bvidAsked)
+    : caching && preferLocal && want.title
+      ? findCachedBySong(want.title, want.artist)
+      : null;
 
   if (localHit) {
     try {
@@ -1473,6 +1476,28 @@ module.exports = function activate(api) {
       return { ok: true, removed, ...cacheStats() };
     } catch (err) {
       return { ok: false, error: String((err && err.message) || err), removed: 0 };
+    }
+  });
+
+  /** 只删当前这首歌（这一个视频）的缓存，别的留着。 */
+  api.rpc.handle('removeCache', async (input) => {
+    setCacheSpec(input && input.cacheDir);
+
+    const bvid = String((input && input.bvid) || '').trim();
+    const title = String((input && input.title) || '').trim();
+    const artist = String((input && input.artist) || '').trim();
+
+    try {
+      let record = bvid ? findCachedByBvid(bvid) : null;
+      if (!record && title) record = findCachedBySong(title, artist);
+      if (!record) return { ok: false, error: 'not-cached' };
+
+      const removed = removeCachedBySlug(record.slug);
+      if (!removed) return { ok: false, error: 'remove-failed', slug: record.slug };
+
+      return { ok: true, slug: record.slug, ...cacheStats() };
+    } catch (err) {
+      return { ok: false, error: String((err && err.message) || err) };
     }
   });
 
