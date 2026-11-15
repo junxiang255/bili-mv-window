@@ -615,22 +615,36 @@ function writeCacheMeta(slug, meta) {
 
 let cacheIndex = null;
 let cacheIndexKey = '';
+let cacheIndexBuilding = null;
 
 function invalidateCacheIndex() {
   cacheIndex = null;
   cacheIndexKey = '';
+  cacheIndexBuilding = null;
 }
 
-/** 扫一遍目录建索引：slug → 记录、bvid → 记录。写盘后置空失效。 */
-function getCacheIndex() {
+/**
+ * 扫目录建索引：slug → 记录、bvid → 记录。写盘后置空失效。
+ *
+ * 全用 fs.promises：缓存多了也不会把 main 进程同步卡住（审查意见）。
+ */
+async function ensureCacheIndex() {
   const dir = getCacheDir();
   if (cacheIndex && cacheIndexKey === dir) return cacheIndex;
+  if (cacheIndexBuilding) return cacheIndexBuilding;
 
-  const bySlug = new Map();
-  const byBvid = new Map();
+  cacheIndexBuilding = (async () => {
+    const bySlug = new Map();
+    const byBvid = new Map();
 
-  try {
-    for (const entry of fs.readdirSync(dir)) {
+    let entries = [];
+    try {
+      entries = await fs.promises.readdir(dir);
+    } catch {
+      entries = [];
+    }
+
+    for (const entry of entries) {
       if (!entry.endsWith('.json')) continue;
 
       const slug = entry.slice(0, -5);
@@ -638,7 +652,7 @@ function getCacheIndex() {
 
       let stat;
       try {
-        stat = fs.statSync(video);
+        stat = await fs.promises.stat(video);
       } catch {
         continue;
       }
@@ -646,7 +660,7 @@ function getCacheIndex() {
 
       let meta = {};
       try {
-        meta = JSON.parse(fs.readFileSync(nodePath.join(dir, entry), 'utf8')) || {};
+        meta = JSON.parse(await fs.promises.readFile(nodePath.join(dir, entry), 'utf8')) || {};
       } catch {
         meta = {};
       }
@@ -667,48 +681,48 @@ function getCacheIndex() {
       bySlug.set(slug, record);
       if (record.bvid) byBvid.set(record.bvid, record);
     }
-  } catch {
-    /* 目录还不存在就当空的 */
-  }
 
-  cacheIndex = { bySlug, byBvid };
-  cacheIndexKey = dir;
-  return cacheIndex;
+    cacheIndex = { bySlug, byBvid };
+    cacheIndexKey = dir;
+    cacheIndexBuilding = null;
+    return cacheIndex;
+  })();
+
+  return cacheIndexBuilding;
 }
 
-function findCachedByBvid(bvid) {
+async function findCachedByBvid(bvid) {
   try {
-    return getCacheIndex().byBvid.get(String(bvid)) || null;
+    return (await ensureCacheIndex()).byBvid.get(String(bvid)) || null;
   } catch {
     return null;
   }
 }
 
 /** 按「歌名 - 歌手」找本地文件 —— 优先本地播放就靠它。 */
-function findCachedBySong(title, artist) {
+async function findCachedBySong(title, artist) {
   if (!title) return null;
   try {
-    return getCacheIndex().bySlug.get(songSlug(title, artist)) || null;
+    return (await ensureCacheIndex()).bySlug.get(songSlug(title, artist)) || null;
   } catch {
     return null;
   }
 }
 
-function hasCachedVideo(bvid) {
-  return Boolean(findCachedByBvid(bvid));
+async function hasCachedVideo(bvid) {
+  return Boolean(await findCachedByBvid(bvid));
 }
-
-function listCachedVideos() {
+async function listCachedVideos() {
   try {
-    return [...getCacheIndex().bySlug.values()].sort((a, b) => a.at - b.at);
+    return [...(await ensureCacheIndex()).bySlug.values()].sort((a, b) => a.at - b.at);
   } catch {
     return [];
   }
 }
 
-function cacheStats() {
+async function cacheStats() {
   const dir = getCacheDir();
-  const files = listCachedVideos();
+  const files = await listCachedVideos();
   return {
     count: files.length,
     bytes: files.reduce((sum, file) => sum + file.size, 0),
@@ -728,23 +742,23 @@ function removeCachedBySlug(slug) {
   }
 }
 
-function removeCachedVideo(bvid) {
-  const record = findCachedByBvid(bvid);
+async function removeCachedVideo(bvid) {
+  const record = await findCachedByBvid(bvid);
   return record ? removeCachedBySlug(record.slug) : false;
 }
 
-function clearCacheDir() {
+async function clearCacheDir() {
   let removed = 0;
-  for (const file of listCachedVideos()) {
+  for (const file of await listCachedVideos()) {
     if (removeCachedBySlug(file.slug)) removed += 1;
   }
   invalidateCacheIndex();
   return removed;
 }
 
-function pruneCache(limitBytes) {
+async function pruneCache(limitBytes) {
   const limit = Number(limitBytes) > 0 ? Number(limitBytes) : 1024 * 1024 * 1024;
-  const files = listCachedVideos();
+  const files = await listCachedVideos();
   let total = files.reduce((sum, file) => sum + file.size, 0);
   let removed = 0;
 
@@ -758,7 +772,6 @@ function pruneCache(limitBytes) {
 
   return { removed, total };
 }
-
 /** 下载视频轨到 `<歌名 - 歌手>.m4s`，并写同名 .json。CDN 偶尔 5xx，自动重试两次。 */
 async function downloadToCache(slug, remoteUrl, meta, attempt = 0) {
   try {
@@ -837,25 +850,47 @@ function registerToken(url, contentType = 'video/mp4', ttlMs = 2 * 60 * 60 * 100
   return token;
 }
 
-/** 从磁盘读缓存好的视频，支持 Range —— 拖进度条要靠它。 */
-function serveLocal(rawName, req, res) {
-  let name = '';
-  try {
-    name = decodeURIComponent(rawName);
-  } catch {
-    name = '';
-  }
+/* ------------------------------------------------------------------ *
+ * 本地文件的访问凭据
+ *
+ * /f/<token>，token → slug 只存在 main 进程里。URI 里不出现文件名，
+ * 所以任何网页就算扫到端口，也只能拿到 404 —— 探不出用户缓存了哪些歌。
+ * ------------------------------------------------------------------ */
 
-  // 文件名就是「歌名 - 歌手」，但绝不能让它跑出缓存目录
-  if (!name || name.includes('..') || /[\\/]/.test(name) || name.length > 180) {
-    res.writeHead(400);
+const localTokens = new Map();
+
+function registerLocalToken(slug, ttlMs = 2 * 60 * 60 * 1000) {
+  const token = crypto.randomBytes(16).toString('hex');
+  localTokens.set(token, { slug, expiresAt: Date.now() + ttlMs });
+  if (localTokens.size > 128) {
+    const now = Date.now();
+    for (const [key, value] of localTokens) if (value.expiresAt < now) localTokens.delete(key);
+  }
+  return token;
+}
+
+function resolveLocalToken(token) {
+  const entry = localTokens.get(String(token));
+  if (!entry) return null;
+  if (entry.expiresAt < Date.now()) {
+    localTokens.delete(String(token));
+    return null;
+  }
+  return entry.slug;
+}
+
+/** 从磁盘读缓存好的视频，支持 Range —— 拖进度条要靠它。只认 token。 */
+async function serveLocal(rawToken, req, res) {
+  const slug = resolveLocalToken(rawToken);
+  if (!slug) {
+    res.writeHead(404);
     res.end();
     return;
   }
 
   let file;
   try {
-    file = videoPathOf(name);
+    file = videoPathOf(slug);
   } catch {
     res.writeHead(404);
     res.end();
@@ -864,7 +899,7 @@ function serveLocal(rawName, req, res) {
 
   let size;
   try {
-    size = fs.statSync(file).size;
+    size = (await fs.promises.stat(file)).size;
   } catch {
     res.writeHead(404);
     res.end();
@@ -902,8 +937,17 @@ function serveLocal(rawName, req, res) {
   });
   fs.createReadStream(file).pipe(res);
 }
-
 function handleProxy(req, res) {
+  // 只接受打到本机端口的请求。防 DNS rebinding：别的域名解析到 127.0.0.1 时，
+  // Host 头不是 127.0.0.1:<port> / localhost:<port>，直接拒。
+  const host = String(req.headers.host || '').toLowerCase();
+  const allowedHosts = [`127.0.0.1:${proxyPort}`, `localhost:${proxyPort}`];
+  if (!allowedHosts.includes(host)) {
+    res.writeHead(403);
+    res.end();
+    return;
+  }
+
   let requestUrl;
   try {
     requestUrl = new URL(req.url || '/', 'http://127.0.0.1');
@@ -914,7 +958,14 @@ function handleProxy(req, res) {
   }
 
   if (requestUrl.pathname.startsWith('/f/')) {
-    serveLocal(requestUrl.pathname.slice(3), req, res);
+    // token → slug 的映射只在 main 里，URI 不含文件名
+    serveLocal(requestUrl.pathname.slice(3), req, res).catch(() => {
+      try {
+        res.destroy();
+      } catch {
+        /* 已经结束了 */
+      }
+    });
     return;
   }
 
@@ -1014,6 +1065,9 @@ function absoluteCover(url) {
 function buildLocalResult(record) {
   if (!record || !proxyServer) return null;
 
+  // 发一个一次性 token 而不是文件名：URI 里看不出是哪首歌
+  const token = registerLocalToken(record.slug);
+
   return {
     ok: true,
     bvid: record.bvid || record.slug,
@@ -1024,7 +1078,7 @@ function buildLocalResult(record) {
     score: null,
     sources: [
       {
-        url: `http://127.0.0.1:${proxyPort}/f/${encodeURIComponent(record.slug)}`,
+        url: `http://127.0.0.1:${proxyPort}/f/${token}`,
         kind: 'local',
         videoOnly: true,
       },
@@ -1097,9 +1151,9 @@ async function resolveMv(input) {
   const preferLocal = !input || input.preferLocal !== false;
 
   const localHit = bvidAsked
-    ? findCachedByBvid(bvidAsked)
+    ? await findCachedByBvid(bvidAsked)
     : caching && preferLocal && want.title
-      ? findCachedBySong(want.title, want.artist)
+      ? await findCachedBySong(want.title, want.artist)
       : null;
 
   if (localHit) {
@@ -1219,7 +1273,7 @@ async function resolveMv(input) {
     const cacheArtist = want.artist || '';
     const slug = songSlug(cacheTitle, cacheArtist);
 
-    if (!findCachedBySong(cacheTitle, cacheArtist)) {
+    if (!(await findCachedBySong(cacheTitle, cacheArtist))) {
       const cacheUrl = urls.video.url;
       const limitBytes =
         Number(input.cacheLimitMb) > 0 ? Number(input.cacheLimitMb) * 1024 * 1024 : undefined;
@@ -1240,7 +1294,7 @@ async function resolveMv(input) {
               codecid: urls.video.codecid,
             },
           });
-          pruneCache(limitBytes);
+          await pruneCache(limitBytes);
         } catch {
           /* 后台存失败就算了，下次播放还是走远程 */
         }
@@ -1423,7 +1477,7 @@ module.exports = function activate(api) {
     const wantedTitle = String((input && input.title) || '').trim();
     const wantedArtist = String((input && input.artist) || '').trim();
 
-    if (hasCachedVideo(bvid)) return { ok: true, cached: true, already: true };
+    if (await hasCachedVideo(bvid)) return { ok: true, cached: true, already: true };
 
     try {
       const meta = await getVideoMeta(bvid);
@@ -1452,9 +1506,9 @@ module.exports = function activate(api) {
         Number(input && input.cacheLimitMb) > 0
           ? Number(input.cacheLimitMb) * 1024 * 1024
           : undefined;
-      pruneCache(limitBytes);
+      await pruneCache(limitBytes);
 
-      return { ok: true, cached: true, slug, stats: cacheStats() };
+      return { ok: true, cached: true, slug, stats: await cacheStats() };
     } catch (err) {
       return { ok: false, error: String((err && err.message) || err) };
     }
@@ -1463,7 +1517,7 @@ module.exports = function activate(api) {
   api.rpc.handle('cacheStats', async (input) => {
     if (input && input.cacheDir) setCacheSpec(input.cacheDir);
     try {
-      return { ok: true, ...cacheStats() };
+      return { ok: true, ...(await cacheStats()) };
     } catch (err) {
       return { ok: false, error: String((err && err.message) || err), count: 0, bytes: 0, dir: '' };
     }
@@ -1472,8 +1526,8 @@ module.exports = function activate(api) {
   api.rpc.handle('clearCache', async (input) => {
     if (input && input.cacheDir) setCacheSpec(input.cacheDir);
     try {
-      const removed = clearCacheDir();
-      return { ok: true, removed, ...cacheStats() };
+      const removed = await clearCacheDir();
+      return { ok: true, removed, ...(await cacheStats()) };
     } catch (err) {
       return { ok: false, error: String((err && err.message) || err), removed: 0 };
     }
@@ -1488,14 +1542,14 @@ module.exports = function activate(api) {
     const artist = String((input && input.artist) || '').trim();
 
     try {
-      let record = bvid ? findCachedByBvid(bvid) : null;
-      if (!record && title) record = findCachedBySong(title, artist);
+      let record = bvid ? await findCachedByBvid(bvid) : null;
+      if (!record && title) record = await findCachedBySong(title, artist);
       if (!record) return { ok: false, error: 'not-cached' };
 
       const removed = removeCachedBySlug(record.slug);
       if (!removed) return { ok: false, error: 'remove-failed', slug: record.slug };
 
-      return { ok: true, slug: record.slug, ...cacheStats() };
+      return { ok: true, slug: record.slug, ...(await cacheStats()) };
     } catch (err) {
       return { ok: false, error: String((err && err.message) || err) };
     }
@@ -1561,6 +1615,7 @@ module.exports = function activate(api) {
       proxyPort = 0;
     }
     proxyTokens.clear();
+    localTokens.clear();
     session = null;
     sessionAt = 0;
     secretsApi = null;
